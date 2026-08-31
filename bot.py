@@ -17,7 +17,8 @@ Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
 
 Access control: only the Discord user with ID ALLOWED_USER_ID (below) can
-run any slash or prefix command, regardless of who installs the bot.
+run /balance, /imlimited, and the ?balances / ?checknow prefix commands.
+/wallet is open to everyone so anyone can view the addresses to send to.
 """
 
 import asyncio
@@ -32,7 +33,7 @@ from discord.ext import commands, tasks
 
 BALANCES_PATH = "balances.json"
 
-# The only Discord user allowed to run any command on this bot.
+# The only Discord user allowed to run the owner-restricted commands on this bot.
 ALLOWED_USER_ID = 665294621387259921
 
 # BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
@@ -94,14 +95,14 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 
 # ---------------------------------------------------------------------------
-# Access control - only ALLOWED_USER_ID may run any command
+# Access control - only ALLOWED_USER_ID may run owner-restricted commands
 # ---------------------------------------------------------------------------
 
 def owner_only():
     """App-command check that rejects everyone except ALLOWED_USER_ID.
 
     Since User Install lets anyone add this bot to their own account and DM
-    it, this check is what actually keeps the commands private - Discord
+    it, this check is what actually keeps these commands private - Discord
     itself has no allowlist for installs.
     """
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -450,23 +451,20 @@ class WalletView(discord.ui.View):
         if not usdt_address:
             self.usdt_button.disabled = True
 
+    # Open to everyone - no ALLOWED_USER_ID check, so anyone can tap and
+    # reveal the address to send to.
     @discord.ui.button(label="LTC", style=discord.ButtonStyle.secondary, emoji="🪙")
     async def ltc_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != ALLOWED_USER_ID:
-            await interaction.response.send_message("You're not authorized to use this bot.", ephemeral=True)
-            return
         await interaction.response.send_message(self.ltc_address, ephemeral=True)
 
     @discord.ui.button(label="USDT (BEP20)", style=discord.ButtonStyle.secondary, emoji="💵")
     async def usdt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != ALLOWED_USER_ID:
-            await interaction.response.send_message("You're not authorized to use this bot.", ephemeral=True)
-            return
         await interaction.response.send_message(self.usdt_address, ephemeral=True)
 
 
+# Open to everyone - no @owner_only() here, so anyone can run /wallet and
+# see the buttons that reveal the addresses.
 @bot.tree.command(name="wallet", description="Show wallet addresses to send crypto")
-@owner_only()
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def wallet_cmd(interaction: discord.Interaction):
@@ -579,3 +577,4 @@ async def checknow_cmd(ctx):
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+
