@@ -34,7 +34,7 @@ from discord.ext import commands, tasks
 BALANCES_PATH = "balances.json"
 
 # The only Discord user allowed to run the owner-restricted commands on this bot.
-ALLOWED_USER_ID = 665294621387259921
+ALLOWED_USER_ID = 665294621387259921, 645395932812279844
 
 # BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
