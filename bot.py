@@ -547,6 +547,16 @@ async def imlimited_cmd(interaction: discord.Interaction, message: str):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="checknow", description="Force an immediate balance check")
+@owner_only()
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def checknow_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await poll_balances()
+    await interaction.followup.send("Done.")
+
+
 # ---------------------------------------------------------------------------
 # Prefix commands (fallbacks)
 # ---------------------------------------------------------------------------
