@@ -16,7 +16,7 @@ Config comes from environment variables:
 Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
 
-Access control: only the Discord user with ID ALLOWED_USER_ID (below) can
+Access control: only the Discord users in ALLOWED_USER_ID (below) can
 run /balance, /imlimited, and the ?balances / ?checknow prefix commands.
 /wallet is open to everyone so anyone can view the addresses to send to.
 """
@@ -33,8 +33,12 @@ from discord.ext import commands, tasks
 
 BALANCES_PATH = "balances.json"
 
-# The only Discord user allowed to run the owner-restricted commands on this bot.
-ALLOWED_USER_ID = 665294621387259921, 645395932812279844
+# The Discord users allowed to run the owner-restricted commands on this bot.
+# NOTE: this must be a set/tuple of IDs, not a bare comma-separated literal -
+# `a, b` without brackets creates a tuple, which is fine for `in` checks but
+# NOT fine for `!=` comparisons (int != tuple is always True, which locked
+# everyone out, including the owner). Use `in` / `not in` against this.
+ALLOWED_USER_ID = {665294621387259921, 645395932812279844}
 
 # BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
@@ -58,6 +62,12 @@ MIN_NOTIFY_USD = 1.00
 
 # Shared embed color (dark brown) used across all commands/notifications.
 EMBED_COLOR = discord.Color(0x1B1716)
+
+# BlockCypher free tier is capped (3 req/sec, 200 req/hour with no token).
+# When we get a 429, we stop hitting it entirely until this time passes,
+# instead of immediately retrying via the fallback endpoint and digging
+# the hole deeper.
+_BLOCKCYPHER_COOLDOWN_UNTIL = 0.0
 
 
 def get_setting(env_var, default=None, required=True):
@@ -95,7 +105,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 
 # ---------------------------------------------------------------------------
-# Access control - only ALLOWED_USER_ID may run owner-restricted commands
+# Access control - only users in ALLOWED_USER_ID may run owner-restricted commands
 # ---------------------------------------------------------------------------
 
 def owner_only():
@@ -106,7 +116,7 @@ def owner_only():
     itself has no allowlist for installs.
     """
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id != ALLOWED_USER_ID:
+        if interaction.user.id not in ALLOWED_USER_ID:
             await interaction.response.send_message(
                 "You're not authorized to use this bot.", ephemeral=True
             )
@@ -130,9 +140,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 
 async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
     """Fast, lightweight balance-only check (no tx history) - used as a fallback."""
+    global _BLOCKCYPHER_COOLDOWN_UNTIL
+
+    if time.monotonic() < _BLOCKCYPHER_COOLDOWN_UNTIL:
+        return None
+
     url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status == 429:
+                retry_after = float(resp.headers.get("Retry-After", 60))
+                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + retry_after
+                print(f"[warn] BlockCypher rate-limited (balance-only), backing off {retry_after:.0f}s")
+                return None
             if resp.status != 200:
                 return None
             data = await resp.json()
@@ -144,8 +164,17 @@ async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
 async def get_ltc_info(session: aiohttp.ClientSession, address: str):
     """Returns dict with balance (LTC float) and unconfirmed_txrefs (pending txs).
     Falls back to a fast balance-only check if the full endpoint is slow/fails,
-    so a slow pending-tx lookup never blocks the regular balance update."""
+    so a slow pending-tx lookup never blocks the regular balance update.
+    Skips all calls while a rate-limit cooldown is active, and does NOT fall
+    back to the balance-only endpoint if the failure was itself a 429 -
+    hitting the same rate-limited API again only makes it worse."""
+    global _BLOCKCYPHER_COOLDOWN_UNTIL
+
+    if time.monotonic() < _BLOCKCYPHER_COOLDOWN_UNTIL:
+        return None
+
     url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
+    rate_limited = False
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
@@ -154,9 +183,18 @@ async def get_ltc_info(session: aiohttp.ClientSession, address: str):
                     "balance": data.get("balance", 0) / 1e8,
                     "unconfirmed_txrefs": data.get("unconfirmed_txrefs", []),
                 }
-            print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
+            if resp.status == 429:
+                retry_after = float(resp.headers.get("Retry-After", 60))
+                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + retry_after
+                print(f"[warn] BlockCypher rate-limited for {address}, backing off {retry_after:.0f}s")
+                rate_limited = True
+            else:
+                print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         print(f"[warn] LTC info fetch timed out for {address}, falling back to balance-only")
+
+    if rate_limited:
+        return None
 
     fallback_balance = await get_ltc_balance_only(session, address)
     if fallback_balance is None:
@@ -528,7 +566,7 @@ async def on_ready():
 @bot.command(name="balances")
 async def balances_cmd(ctx):
     """?balances - show current known balances"""
-    if ctx.author.id != ALLOWED_USER_ID:
+    if ctx.author.id not in ALLOWED_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
 
@@ -566,7 +604,7 @@ async def balances_cmd(ctx):
 @bot.command(name="checknow")
 async def checknow_cmd(ctx):
     """?checknow - force an immediate balance check"""
-    if ctx.author.id != ALLOWED_USER_ID:
+    if ctx.author.id not in ALLOWED_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
 
@@ -577,4 +615,3 @@ async def checknow_cmd(ctx):
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
-
