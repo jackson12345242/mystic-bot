@@ -66,8 +66,12 @@ EMBED_COLOR = discord.Color(0x1B1716)
 # BlockCypher free tier is capped (3 req/sec, 200 req/hour with no token).
 # When we get a 429, we stop hitting it entirely until this time passes,
 # instead of immediately retrying via the fallback endpoint and digging
-# the hole deeper.
+# the hole deeper. _BLOCKCYPHER_FAIL_COUNT drives exponential backoff: a
+# flat 60s retry does nothing once you've blown through the *hourly* cap,
+# since you'll just get 429'd again on the very next poll.
 _BLOCKCYPHER_COOLDOWN_UNTIL = 0.0
+_BLOCKCYPHER_FAIL_COUNT = 0
+_BLOCKCYPHER_MAX_COOLDOWN = 1800  # 30 min ceiling
 
 
 def get_setting(env_var, default=None, required=True):
@@ -138,68 +142,63 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 # Balance / price fetch helpers
 # ---------------------------------------------------------------------------
 
-async def get_ltc_balance_only(session: aiohttp.ClientSession, address: str):
-    """Fast, lightweight balance-only check (no tx history) - used as a fallback."""
-    global _BLOCKCYPHER_COOLDOWN_UNTIL
+async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
+    """Fetch balance + pending info for ALL LTC addresses in ONE BlockCypher
+    request (semicolon-joined addrs endpoint), instead of one request per
+    address. This is the single biggest lever for staying under BlockCypher's
+    free-tier hourly cap - N addresses now cost 1 request instead of N.
 
+    Returns {address: {"balance": float, "unconfirmed_txrefs": [...]}} for
+    addresses BlockCypher returned data for; empty dict on failure/cooldown.
+    """
+    global _BLOCKCYPHER_COOLDOWN_UNTIL, _BLOCKCYPHER_FAIL_COUNT
+
+    if not addresses:
+        return {}
     if time.monotonic() < _BLOCKCYPHER_COOLDOWN_UNTIL:
-        return None
+        return {}
 
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
+    joined = ";".join(addresses)
+    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{joined}"
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 429:
                 retry_after = float(resp.headers.get("Retry-After", 60))
-                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + retry_after
-                print(f"[warn] BlockCypher rate-limited (balance-only), backing off {retry_after:.0f}s")
-                return None
+                _BLOCKCYPHER_FAIL_COUNT += 1
+                # Exponential backoff on top of Retry-After, capped at 30 min.
+                # A flat 60s retry was just re-hitting the same hourly cap
+                # every single poll cycle (that's what the endless log of
+                # "backing off 60s" warnings was) without ever recovering.
+                backoff = min(
+                    max(retry_after, 60) * (2 ** (_BLOCKCYPHER_FAIL_COUNT - 1)),
+                    _BLOCKCYPHER_MAX_COOLDOWN,
+                )
+                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + backoff
+                print(f"[warn] BlockCypher rate-limited (batch of {len(addresses)}), backing off {backoff:.0f}s")
+                return {}
             if resp.status != 200:
-                return None
+                print(f"[warn] LTC batch fetch failed: HTTP {resp.status}")
+                return {}
             data = await resp.json()
-            return data.get("balance", 0) / 1e8
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        return None
+        print("[warn] LTC batch fetch timed out")
+        return {}
 
+    _BLOCKCYPHER_FAIL_COUNT = 0
 
-async def get_ltc_info(session: aiohttp.ClientSession, address: str):
-    """Returns dict with balance (LTC float) and unconfirmed_txrefs (pending txs).
-    Falls back to a fast balance-only check if the full endpoint is slow/fails,
-    so a slow pending-tx lookup never blocks the regular balance update.
-    Skips all calls while a rate-limit cooldown is active, and does NOT fall
-    back to the balance-only endpoint if the failure was itself a 429 -
-    hitting the same rate-limited API again only makes it worse."""
-    global _BLOCKCYPHER_COOLDOWN_UNTIL
-
-    if time.monotonic() < _BLOCKCYPHER_COOLDOWN_UNTIL:
-        return None
-
-    url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}"
-    rate_limited = False
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return {
-                    "balance": data.get("balance", 0) / 1e8,
-                    "unconfirmed_txrefs": data.get("unconfirmed_txrefs", []),
-                }
-            if resp.status == 429:
-                retry_after = float(resp.headers.get("Retry-After", 60))
-                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + retry_after
-                print(f"[warn] BlockCypher rate-limited for {address}, backing off {retry_after:.0f}s")
-                rate_limited = True
-            else:
-                print(f"[warn] LTC info fetch failed for {address}: HTTP {resp.status}, falling back")
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        print(f"[warn] LTC info fetch timed out for {address}, falling back to balance-only")
-
-    if rate_limited:
-        return None
-
-    fallback_balance = await get_ltc_balance_only(session, address)
-    if fallback_balance is None:
-        return None
-    return {"balance": fallback_balance, "unconfirmed_txrefs": []}
+    # BlockCypher returns a single object for one address, a list for
+    # multiple - normalize to a list either way.
+    entries = data if isinstance(data, list) else [data]
+    results = {}
+    for entry in entries:
+        addr = entry.get("address")
+        if not addr:
+            continue
+        results[addr] = {
+            "balance": entry.get("balance", 0) / 1e8,
+            "unconfirmed_txrefs": entry.get("unconfirmed_txrefs", []),
+        }
+    return results
 
 
 async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
@@ -281,16 +280,15 @@ async def poll_balances():
 
     changed = False
     async with aiohttp.ClientSession() as session:
-        ltc_results = await asyncio.gather(
-            *(get_ltc_info(session, address) for address in LTC_ADDRESSES)
-        )
+        ltc_info_by_address = await get_ltc_info_batch(session, LTC_ADDRESSES)
         usdt_results = await asyncio.gather(
             *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
         )
 
         prices = await get_usd_prices(session)
 
-        for address, info in zip(LTC_ADDRESSES, ltc_results):
+        for address in LTC_ADDRESSES:
+            info = ltc_info_by_address.get(address)
             if info is None:
                 continue
             new_confirmed = info["balance"]
