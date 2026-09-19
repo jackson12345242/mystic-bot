@@ -11,6 +11,8 @@ Config comes from environment variables:
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     BSC_USDT_ADDRESSES     - comma-separated list of BEP20 USDT addresses
     POLL_SECONDS            - how often to check, default 45
+    LTC_MIN_INTERVAL        - min seconds between BlockCypher requests, default 120
+    BLOCKCYPHER_TOKEN       - optional free BlockCypher token (much higher rate limits)
     PREFIX                  - command prefix, default "?"
 
 Balances persist in balances.json (created automatically) so restarts don't
@@ -43,7 +45,7 @@ ALLOWED_USER_ID = {665294621387259921, 645395932812279844}
 # BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
 
-# Free public BSC RPC endpoints (no API key needed) - tried in order
+# Free public BSC RPC endpoints (no API key needed) - all raced concurrently
 BSC_RPC_ENDPOINTS = [
     "https://bsc-dataseed.binance.org/",
     "https://bsc-dataseed1.defibit.io/",
@@ -63,15 +65,17 @@ MIN_NOTIFY_USD = 1.00
 # Shared embed color (dark brown) used across all commands/notifications.
 EMBED_COLOR = discord.Color(0x1B1716)
 
-# BlockCypher free tier is capped (3 req/sec, 200 req/hour with no token).
-# When we get a 429, we stop hitting it entirely until this time passes,
-# instead of immediately retrying via the fallback endpoint and digging
-# the hole deeper. _BLOCKCYPHER_FAIL_COUNT drives exponential backoff: a
-# flat 60s retry does nothing once you've blown through the *hourly* cap,
-# since you'll just get 429'd again on the very next poll.
+# BlockCypher's free tier has a small *hourly* cap. Two things keep us under it:
+#   1. LTC_MIN_INTERVAL: we never call BlockCypher more often than this,
+#      no matter how fast POLL_SECONDS is (USDT still polls every cycle).
+#   2. Exponential backoff after a 429. The fail counter only decays by one
+#      per successful request (it used to reset to 0 on the first success,
+#      which is why the log kept cycling 60s -> 120s -> ... -> 1800s -> 60s
+#      forever without ever recovering from the hourly cap).
 _BLOCKCYPHER_COOLDOWN_UNTIL = 0.0
 _BLOCKCYPHER_FAIL_COUNT = 0
-_BLOCKCYPHER_MAX_COOLDOWN = 1800  # 30 min ceiling
+_BLOCKCYPHER_MAX_COOLDOWN = 3600  # 1 hour ceiling (the cap is hourly)
+_LTC_LAST_FETCH = float("-inf")
 
 
 def get_setting(env_var, default=None, required=True):
@@ -86,6 +90,8 @@ DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
 BSC_USDT_ADDRESSES = [a.strip() for a in get_setting("BSC_USDT_ADDRESSES", default="", required=False).split(",") if a.strip()]
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
+LTC_MIN_INTERVAL = int(get_setting("LTC_MIN_INTERVAL", default=120, required=False))
+BLOCKCYPHER_TOKEN = get_setting("BLOCKCYPHER_TOKEN", default="", required=False).strip()
 PREFIX = get_setting("PREFIX", default="?", required=False)
 
 
@@ -145,32 +151,39 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
     """Fetch balance + pending info for ALL LTC addresses in ONE BlockCypher
     request (semicolon-joined addrs endpoint), instead of one request per
-    address. This is the single biggest lever for staying under BlockCypher's
-    free-tier hourly cap - N addresses now cost 1 request instead of N.
+    address.
 
     Returns {address: {"balance": float, "unconfirmed_txrefs": [...]}} for
-    addresses BlockCypher returned data for; empty dict on failure/cooldown.
+    addresses BlockCypher returned data for; empty dict on failure, cooldown,
+    or when it's too soon since the last request.
     """
-    global _BLOCKCYPHER_COOLDOWN_UNTIL, _BLOCKCYPHER_FAIL_COUNT
+    global _BLOCKCYPHER_COOLDOWN_UNTIL, _BLOCKCYPHER_FAIL_COUNT, _LTC_LAST_FETCH
 
     if not addresses:
         return {}
-    if time.monotonic() < _BLOCKCYPHER_COOLDOWN_UNTIL:
+
+    now = time.monotonic()
+    if now < _BLOCKCYPHER_COOLDOWN_UNTIL:
         return {}
+    if now - _LTC_LAST_FETCH < LTC_MIN_INTERVAL:
+        return {}
+    _LTC_LAST_FETCH = now
 
     joined = ";".join(addresses)
     url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{joined}"
+    if BLOCKCYPHER_TOKEN:
+        url += f"?token={BLOCKCYPHER_TOKEN}"
+
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 429:
-                retry_after = float(resp.headers.get("Retry-After", 60))
+                try:
+                    retry_after = float(resp.headers.get("Retry-After", 60))
+                except ValueError:
+                    retry_after = 60.0
                 _BLOCKCYPHER_FAIL_COUNT += 1
-                # Exponential backoff on top of Retry-After, capped at 30 min.
-                # A flat 60s retry was just re-hitting the same hourly cap
-                # every single poll cycle (that's what the endless log of
-                # "backing off 60s" warnings was) without ever recovering.
                 backoff = min(
-                    max(retry_after, 60) * (2 ** (_BLOCKCYPHER_FAIL_COUNT - 1)),
+                    max(retry_after, 120) * (2 ** (_BLOCKCYPHER_FAIL_COUNT - 1)),
                     _BLOCKCYPHER_MAX_COOLDOWN,
                 )
                 _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + backoff
@@ -184,7 +197,9 @@ async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
         print("[warn] LTC batch fetch timed out")
         return {}
 
-    _BLOCKCYPHER_FAIL_COUNT = 0
+    # Decay (don't wipe) the failure counter, so one lucky request right after
+    # a cooldown doesn't reset the backoff back to the minimum.
+    _BLOCKCYPHER_FAIL_COUNT = max(0, _BLOCKCYPHER_FAIL_COUNT - 1)
 
     # BlockCypher returns a single object for one address, a list for
     # multiple - normalize to a list either way.
@@ -230,8 +245,6 @@ async def get_usdt_bep20_balance(session: aiohttp.ClientSession, address: str):
             try:
                 result = await coro
                 if result is not None:
-                    for t in tasks_list:
-                        t.cancel()
                     return result
             except Exception:
                 continue
@@ -274,83 +287,104 @@ async def get_usd_prices(session: aiohttp.ClientSession):
 # Background polling loop
 # ---------------------------------------------------------------------------
 
-@tasks.loop(seconds=POLL_SECONDS)
-async def poll_balances():
+# Serializes polls so /checknow can't run at the same time as the scheduled
+# loop (which could double-send notifications).
+_poll_lock = asyncio.Lock()
+
+
+async def _poll_once():
     owner = bot.get_user(DISCORD_USER_ID) or await bot.fetch_user(DISCORD_USER_ID)
 
     changed = False
-    async with aiohttp.ClientSession() as session:
-        ltc_info_by_address = await get_ltc_info_batch(session, LTC_ADDRESSES)
-        usdt_results = await asyncio.gather(
-            *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
-        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            ltc_info_by_address = await get_ltc_info_batch(session, LTC_ADDRESSES)
+            usdt_results = await asyncio.gather(
+                *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
+            )
 
-        prices = await get_usd_prices(session)
+            prices = await get_usd_prices(session)
 
-        for address in LTC_ADDRESSES:
-            info = ltc_info_by_address.get(address)
-            if info is None:
-                continue
-            new_confirmed = info["balance"]
-            key = f"ltc:{address}"
-
-            # LTC entries are stored as {"confirmed": float, "pending": {txid: value}}.
-            # Older balances.json files stored a plain float for LTC - upgrade in place.
-            stored = balances.get(key)
-            if isinstance(stored, dict):
-                old_confirmed = stored.get("confirmed")
-                old_pending = stored.get("pending", {})
-            else:
-                old_confirmed = stored
-                old_pending = {}
-
-            current_pending = {}
-            for tx in info.get("unconfirmed_txrefs", []):
-                txid = tx.get("tx_hash")
-                if not txid:
+            for address in LTC_ADDRESSES:
+                info = ltc_info_by_address.get(address)
+                if info is None:
                     continue
-                is_incoming = tx.get("tx_output_n", -1) != -1
-                current_pending[txid] = {
-                    "value": tx.get("value", 0) / 1e8,
-                    "incoming": is_incoming,
-                }
+                new_confirmed = info["balance"]
+                key = f"ltc:{address}"
 
-            # New pending tx we haven't alerted on yet -> "seen in mempool" notice,
-            # but only if it clears the same $ threshold as confirmed transfers.
-            for txid, tx in current_pending.items():
-                if txid not in old_pending:
-                    pending_usd = tx["value"] * prices.get("LTC", 0)
-                    if pending_usd >= MIN_NOTIFY_USD:
-                        await notify_ltc_pending(session, owner, address, tx["value"], tx["incoming"])
+                # LTC entries are stored as {"confirmed": float, "pending": {txid: value}}.
+                # Older balances.json files stored a plain float for LTC - upgrade in place.
+                stored = balances.get(key)
+                if isinstance(stored, dict):
+                    old_confirmed = stored.get("confirmed")
+                    old_pending = stored.get("pending", {})
+                else:
+                    old_confirmed = stored
+                    old_pending = {}
 
-            # Confirmed balance actually moved -> the real "money arrived/left" notice
-            if old_confirmed is not None and abs(new_confirmed - old_confirmed) > 1e-8:
-                diff_usd = abs(new_confirmed - old_confirmed) * prices.get("LTC", 0)
-                if diff_usd >= MIN_NOTIFY_USD:
-                    await notify(session, owner, address, old_confirmed, new_confirmed, "LTC")
+                current_pending = {}
+                for tx in info.get("unconfirmed_txrefs", []):
+                    txid = tx.get("tx_hash")
+                    if not txid:
+                        continue
+                    is_incoming = tx.get("tx_output_n", -1) != -1
+                    current_pending[txid] = {
+                        "value": tx.get("value", 0) / 1e8,
+                        "incoming": is_incoming,
+                    }
 
-            if old_confirmed != new_confirmed or old_pending != current_pending:
-                balances[key] = {"confirmed": new_confirmed, "pending": current_pending}
-                changed = True
+                # New pending tx we haven't alerted on yet -> "seen in mempool" notice,
+                # but only if it clears the same $ threshold as confirmed transfers.
+                for txid, tx in current_pending.items():
+                    if txid not in old_pending:
+                        pending_usd = tx["value"] * prices.get("LTC", 0)
+                        if pending_usd >= MIN_NOTIFY_USD:
+                            await notify_ltc_pending(session, owner, address, tx["value"], tx["incoming"])
 
-        for address, new_balance in zip(BSC_USDT_ADDRESSES, usdt_results):
-            if new_balance is None:
-                continue
-            key = f"usdt_bep20:{address}"
-            old_balance = balances.get(key)
-            if old_balance is not None and abs(new_balance - old_balance) > 1e-6:
-                diff_usd = abs(new_balance - old_balance) * prices.get("USDT", 1)
-                if diff_usd >= MIN_NOTIFY_USD:
-                    await notify(session, owner, address, old_balance, new_balance, "USDT")
-            if old_balance != new_balance:
-                balances[key] = new_balance
-                changed = True
+                # Confirmed balance actually moved -> the real "money arrived/left" notice
+                if old_confirmed is not None and abs(new_confirmed - old_confirmed) > 1e-8:
+                    diff_usd = abs(new_confirmed - old_confirmed) * prices.get("LTC", 0)
+                    if diff_usd >= MIN_NOTIFY_USD:
+                        await notify(session, owner, address, old_confirmed, new_confirmed, "LTC")
 
-    if changed:
+                if old_confirmed != new_confirmed or old_pending != current_pending:
+                    balances[key] = {"confirmed": new_confirmed, "pending": current_pending}
+                    changed = True
+
+            for address, new_balance in zip(BSC_USDT_ADDRESSES, usdt_results):
+                if new_balance is None:
+                    continue
+                key = f"usdt_bep20:{address}"
+                old_balance = balances.get(key)
+                if old_balance is not None and abs(new_balance - old_balance) > 1e-6:
+                    diff_usd = abs(new_balance - old_balance) * prices.get("USDT", 1)
+                    if diff_usd >= MIN_NOTIFY_USD:
+                        await notify(session, owner, address, old_balance, new_balance, "USDT")
+                if old_balance != new_balance:
+                    balances[key] = new_balance
+                    changed = True
+    finally:
+        # Save even if something blew up midway, so we don't re-notify next cycle.
+        if changed:
+            try:
+                save_balances(balances)
+            except Exception as e:
+                print(f"[error] Failed to save balances: {e}")
+
+
+async def run_poll():
+    """Run one poll cycle. Never raises - a transient error (Discord 503,
+    network blip, etc.) just skips this cycle instead of killing the loop."""
+    async with _poll_lock:
         try:
-            save_balances(balances)
+            await _poll_once()
         except Exception as e:
-            print(f"[error] Failed to save balances: {e}")
+            print(f"[error] poll cycle failed, will retry next cycle: {e!r}")
+
+
+@tasks.loop(seconds=POLL_SECONDS)
+async def poll_balances():
+    await run_poll()
 
 
 async def notify_ltc_pending(session, owner, address, amount, incoming):
@@ -375,6 +409,8 @@ async def notify_ltc_pending(session, owner, address, amount, incoming):
         await owner.send(embed=embed)
     except discord.Forbidden:
         print("[warn] Could not DM owner — check shared server / DM privacy settings.")
+    except discord.HTTPException as e:
+        print(f"[warn] Failed to DM owner: {e}")
 
 
 async def notify(session, owner, address, old_balance, new_balance, unit):
@@ -403,6 +439,8 @@ async def notify(session, owner, address, old_balance, new_balance, unit):
         await owner.send(embed=embed)
     except discord.Forbidden:
         print("[warn] Could not DM owner — check shared server / DM privacy settings.")
+    except discord.HTTPException as e:
+        print(f"[warn] Failed to DM owner: {e}")
 
 
 @poll_balances.before_loop
@@ -412,9 +450,12 @@ async def before_poll():
 
 @poll_balances.error
 async def poll_balances_error(error):
-    print(f"[error] poll_balances loop crashed: {error}")
-    if not poll_balances.is_running():
-        poll_balances.restart()
+    # run_poll() swallows normal exceptions, so this is a last-resort safety
+    # net. NOTE: poll_balances.is_running() is still True while this handler
+    # runs, so the old `if not is_running(): restart()` never fired and the
+    # loop stayed dead after the crash. Schedule the restart instead.
+    print(f"[error] poll_balances loop crashed: {error!r}")
+    asyncio.get_running_loop().call_later(30, poll_balances.restart)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +592,7 @@ async def imlimited_cmd(interaction: discord.Interaction, message: str):
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def checknow_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await poll_balances()
+    await run_poll()
     await interaction.followup.send("Done.")
 
 
@@ -617,7 +658,7 @@ async def checknow_cmd(ctx):
         return
 
     await ctx.send("Checking now...")
-    await poll_balances()
+    await run_poll()
     await ctx.send("Done.")
 
 
