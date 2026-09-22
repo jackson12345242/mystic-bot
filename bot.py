@@ -8,6 +8,10 @@ changes by at least MIN_NOTIFY_USD, and offers /balance, /wallet, and
 Config comes from environment variables:
     DISCORD_TOKEN        - the bot's token
     DISCORD_USER_ID       - your Discord user ID (numeric), who gets DMed
+                            (this is also the ONLY user allowed to run the
+                            owner-only commands - see owner_only() below.
+                            /wallet is open to everyone.)
+                            Defaults to 1318513875372605481 if not set.
     LTC_ADDRESSES          - comma-separated list of Litecoin addresses
     BSC_USDT_ADDRESSES     - comma-separated list of BEP20 USDT addresses
     POLL_SECONDS            - how often to check, default 45
@@ -18,13 +22,14 @@ Config comes from environment variables:
 Balances persist in balances.json (created automatically) so restarts don't
 cause false "change" notifications.
 
-Access control: only the Discord users in ALLOWED_USER_ID (below) can
-run /balance, /imlimited, and the ?balances / ?checknow prefix commands.
+Access control: only the Discord user with ID DISCORD_USER_ID can run
+/balance, /imlimited, /checknow, and the ?balances / ?checknow prefix commands.
 /wallet is open to everyone so anyone can view the addresses to send to.
 """
 
 import asyncio
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -33,14 +38,16 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-BALANCES_PATH = "balances.json"
+# discord.py logs every gateway reconnect/resume at INFO level, which on a
+# long-running bot adds up to dozens of lines a day that all say the same
+# thing and drown out anything actually worth seeing. Reconnects/resumes on
+# their own aren't errors -- Discord gateway connections drop and resume
+# periodically as a matter of course -- so this just quiets that specific
+# noise down to WARNING+ (actual connection problems still show up).
+logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+logging.getLogger("discord.client").setLevel(logging.WARNING)
 
-# The Discord users allowed to run the owner-restricted commands on this bot.
-# NOTE: this must be a set/tuple of IDs, not a bare comma-separated literal -
-# `a, b` without brackets creates a tuple, which is fine for `in` checks but
-# NOT fine for `!=` comparisons (int != tuple is always True, which locked
-# everyone out, including the owner). Use `in` / `not in` against this.
-ALLOWED_USER_ID = {665294621387259921, 645395932812279844}
+BALANCES_PATH = "balances.json"
 
 # BEP20 (Binance-Peg) USDT contract address on BNB Smart Chain
 USDT_BEP20_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
@@ -65,16 +72,23 @@ MIN_NOTIFY_USD = 1.00
 # Shared embed color (dark brown) used across all commands/notifications.
 EMBED_COLOR = discord.Color(0x1B1716)
 
-# BlockCypher's free tier has a small *hourly* cap. Two things keep us under it:
-#   1. LTC_MIN_INTERVAL: we never call BlockCypher more often than this,
-#      no matter how fast POLL_SECONDS is (USDT still polls every cycle).
-#   2. Exponential backoff after a 429. The fail counter only decays by one
-#      per successful request (it used to reset to 0 on the first success,
-#      which is why the log kept cycling 60s -> 120s -> ... -> 1800s -> 60s
-#      forever without ever recovering from the hourly cap).
-_BLOCKCYPHER_COOLDOWN_UNTIL = 0.0
-_BLOCKCYPHER_FAIL_COUNT = 0
-_BLOCKCYPHER_MAX_COOLDOWN = 3600  # 1 hour ceiling (the cap is hourly)
+# --- BlockCypher rate-limit handling ----------------------------------
+# BlockCypher's free tier has a small *hourly* request cap. Three things
+# keep us under it:
+#   1. ALL LTC addresses go in ONE request (semicolon-joined), instead of
+#      one request per address (plus a second "balance-only" fallback
+#      request whenever the first failed - which doubled the traffic
+#      exactly when things were already going wrong).
+#   2. LTC_MIN_INTERVAL: we never call BlockCypher more often than this,
+#      no matter how small POLL_SECONDS is (USDT still polls every cycle).
+#   3. Exponential backoff after a 429. The fail counter only decays by one
+#      per successful request; it used to be wiped on the first success, so
+#      the backoff kept restarting from the bottom and never recovered from
+#      the hourly cap.
+DEFAULT_429_BACKOFF = 120  # seconds, minimum backoff after a 429
+MAX_429_BACKOFF = 3600  # cap (the limit is hourly)
+_BC_COOLDOWN_UNTIL = 0.0
+_BC_FAIL_COUNT = 0
 _LTC_LAST_FETCH = float("-inf")
 
 
@@ -86,7 +100,10 @@ def get_setting(env_var, default=None, required=True):
 
 
 DISCORD_TOKEN = get_setting("DISCORD_TOKEN")
-DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID"))
+# Hardcoded default owner/authorized user ID. This is the only account that
+# can run the owner-only commands (/balance, /imlimited, /checknow,
+# ?balances, ?checknow). /wallet stays open to everyone regardless of this value.
+DISCORD_USER_ID = int(get_setting("DISCORD_USER_ID", default="1318513875372605481", required=False))
 LTC_ADDRESSES = [a.strip() for a in get_setting("LTC_ADDRESSES", default="", required=False).split(",") if a.strip()]
 BSC_USDT_ADDRESSES = [a.strip() for a in get_setting("BSC_USDT_ADDRESSES", default="", required=False).split(",") if a.strip()]
 POLL_SECONDS = int(get_setting("POLL_SECONDS", default=45, required=False))
@@ -115,18 +132,18 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 
 # ---------------------------------------------------------------------------
-# Access control - only users in ALLOWED_USER_ID may run owner-restricted commands
+# Access control - only DISCORD_USER_ID may run owner-restricted commands
 # ---------------------------------------------------------------------------
 
 def owner_only():
-    """App-command check that rejects everyone except ALLOWED_USER_ID.
+    """App-command check that rejects everyone except DISCORD_USER_ID.
 
     Since User Install lets anyone add this bot to their own account and DM
     it, this check is what actually keeps these commands private - Discord
     itself has no allowlist for installs.
     """
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.user.id not in ALLOWED_USER_ID:
+        if interaction.user.id != DISCORD_USER_ID:
             await interaction.response.send_message(
                 "You're not authorized to use this bot.", ephemeral=True
             )
@@ -148,24 +165,24 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 # Balance / price fetch helpers
 # ---------------------------------------------------------------------------
 
-async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
+async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list, force: bool = False):
     """Fetch balance + pending info for ALL LTC addresses in ONE BlockCypher
-    request (semicolon-joined addrs endpoint), instead of one request per
-    address.
+    request.
 
     Returns {address: {"balance": float, "unconfirmed_txrefs": [...]}} for
-    addresses BlockCypher returned data for; empty dict on failure, cooldown,
-    or when it's too soon since the last request.
+    addresses BlockCypher returned data for; empty dict on failure, during a
+    429 cooldown, or when it's too soon since the last request (unless
+    force=True, which skips only the min-interval check, never the cooldown).
     """
-    global _BLOCKCYPHER_COOLDOWN_UNTIL, _BLOCKCYPHER_FAIL_COUNT, _LTC_LAST_FETCH
+    global _BC_COOLDOWN_UNTIL, _BC_FAIL_COUNT, _LTC_LAST_FETCH
 
     if not addresses:
         return {}
 
     now = time.monotonic()
-    if now < _BLOCKCYPHER_COOLDOWN_UNTIL:
+    if now < _BC_COOLDOWN_UNTIL:
         return {}
-    if now - _LTC_LAST_FETCH < LTC_MIN_INTERVAL:
+    if not force and now - _LTC_LAST_FETCH < LTC_MIN_INTERVAL:
         return {}
     _LTC_LAST_FETCH = now
 
@@ -178,15 +195,15 @@ async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 429:
                 try:
-                    retry_after = float(resp.headers.get("Retry-After", 60))
+                    retry_after = float(resp.headers.get("Retry-After", DEFAULT_429_BACKOFF))
                 except ValueError:
-                    retry_after = 60.0
-                _BLOCKCYPHER_FAIL_COUNT += 1
+                    retry_after = DEFAULT_429_BACKOFF
+                _BC_FAIL_COUNT += 1
                 backoff = min(
-                    max(retry_after, 120) * (2 ** (_BLOCKCYPHER_FAIL_COUNT - 1)),
-                    _BLOCKCYPHER_MAX_COOLDOWN,
+                    max(retry_after, DEFAULT_429_BACKOFF) * (2 ** (_BC_FAIL_COUNT - 1)),
+                    MAX_429_BACKOFF,
                 )
-                _BLOCKCYPHER_COOLDOWN_UNTIL = time.monotonic() + backoff
+                _BC_COOLDOWN_UNTIL = time.monotonic() + backoff
                 print(f"[warn] BlockCypher rate-limited (batch of {len(addresses)}), backing off {backoff:.0f}s")
                 return {}
             if resp.status != 200:
@@ -199,7 +216,7 @@ async def get_ltc_info_batch(session: aiohttp.ClientSession, addresses: list):
 
     # Decay (don't wipe) the failure counter, so one lucky request right after
     # a cooldown doesn't reset the backoff back to the minimum.
-    _BLOCKCYPHER_FAIL_COUNT = max(0, _BLOCKCYPHER_FAIL_COUNT - 1)
+    _BC_FAIL_COUNT = max(0, _BC_FAIL_COUNT - 1)
 
     # BlockCypher returns a single object for one address, a list for
     # multiple - normalize to a list either way.
@@ -287,18 +304,18 @@ async def get_usd_prices(session: aiohttp.ClientSession):
 # Background polling loop
 # ---------------------------------------------------------------------------
 
-# Serializes polls so /checknow can't run at the same time as the scheduled
-# loop (which could double-send notifications).
+# Serializes polls so ?checknow / /checknow can't run at the same time as the
+# scheduled loop (which could double-send notifications).
 _poll_lock = asyncio.Lock()
 
 
-async def _poll_once():
+async def _poll_once(force: bool = False):
     owner = bot.get_user(DISCORD_USER_ID) or await bot.fetch_user(DISCORD_USER_ID)
 
     changed = False
     try:
         async with aiohttp.ClientSession() as session:
-            ltc_info_by_address = await get_ltc_info_batch(session, LTC_ADDRESSES)
+            ltc_info_by_address = await get_ltc_info_batch(session, LTC_ADDRESSES, force=force)
             usdt_results = await asyncio.gather(
                 *(get_usdt_bep20_balance(session, address) for address in BSC_USDT_ADDRESSES)
             )
@@ -372,12 +389,12 @@ async def _poll_once():
                 print(f"[error] Failed to save balances: {e}")
 
 
-async def run_poll():
+async def run_poll(force: bool = False):
     """Run one poll cycle. Never raises - a transient error (Discord 503,
     network blip, etc.) just skips this cycle instead of killing the loop."""
     async with _poll_lock:
         try:
-            await _poll_once()
+            await _poll_once(force=force)
         except Exception as e:
             print(f"[error] poll cycle failed, will retry next cycle: {e!r}")
 
@@ -453,7 +470,7 @@ async def poll_balances_error(error):
     # run_poll() swallows normal exceptions, so this is a last-resort safety
     # net. NOTE: poll_balances.is_running() is still True while this handler
     # runs, so the old `if not is_running(): restart()` never fired and the
-    # loop stayed dead after the crash. Schedule the restart instead.
+    # loop stayed dead after a crash. Schedule the restart instead.
     print(f"[error] poll_balances loop crashed: {error!r}")
     asyncio.get_running_loop().call_later(30, poll_balances.restart)
 
@@ -528,8 +545,8 @@ class WalletView(discord.ui.View):
         if not usdt_address:
             self.usdt_button.disabled = True
 
-    # Open to everyone - no ALLOWED_USER_ID check, so anyone can tap and
-    # reveal the address to send to.
+    # Open to everyone - no owner check, so anyone can tap and reveal the
+    # address to send to.
     @discord.ui.button(label="LTC", style=discord.ButtonStyle.secondary, emoji="🪙")
     async def ltc_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(self.ltc_address, ephemeral=True)
@@ -592,7 +609,7 @@ async def imlimited_cmd(interaction: discord.Interaction, message: str):
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def checknow_slash(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await run_poll()
+    await run_poll(force=True)
     await interaction.followup.send("Done.")
 
 
@@ -615,7 +632,7 @@ async def on_ready():
 @bot.command(name="balances")
 async def balances_cmd(ctx):
     """?balances - show current known balances"""
-    if ctx.author.id not in ALLOWED_USER_ID:
+    if ctx.author.id != DISCORD_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
 
@@ -653,12 +670,12 @@ async def balances_cmd(ctx):
 @bot.command(name="checknow")
 async def checknow_cmd(ctx):
     """?checknow - force an immediate balance check"""
-    if ctx.author.id not in ALLOWED_USER_ID:
+    if ctx.author.id != DISCORD_USER_ID:
         await ctx.send("You're not authorized to use this bot.")
         return
 
     await ctx.send("Checking now...")
-    await run_poll()
+    await run_poll(force=True)
     await ctx.send("Done.")
 
 
