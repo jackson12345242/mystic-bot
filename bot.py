@@ -677,6 +677,8 @@ async def checknow_cmd(ctx):
     await ctx.send("Checking now...")
     await run_poll(force=True)
     await ctx.send("Done.")
+from invoice import register_invoice
+register_invoice(bot, owner_only, get_usd_prices, COIN_META, EMBED_COLOR, LTC_ADDRESSES, BSC_USDT_ADDRESSES)
 
 
 if __name__ == "__main__":
